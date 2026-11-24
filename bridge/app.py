@@ -386,6 +386,7 @@ def claim_job(job_id: str, claims: dict = Depends(worker_claims)):
         "language": job["language"],
         "reference_text": job["reference_text"],
         "voice_sample_url": sample_url,
+        "voice_sample_host": urlparse(sample_url).hostname,
         "voice_sample_filename": job["sample_path"].rsplit("/", 1)[-1],
     }
 

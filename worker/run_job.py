@@ -73,6 +73,7 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
     language = job.get("language")
     reference_text = job.get("reference_text")
     sample_url = job.get("voice_sample_url")
+    sample_host = job.get("voice_sample_host")
     sample_filename = job.get("voice_sample_filename")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
         invalid_job("text")
@@ -83,13 +84,10 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
     if not isinstance(sample_url, str):
         invalid_job("sample_url_missing")
     parsed = urlparse(sample_url)
-    allowed_hosts = {
-        host.strip().lower()
-        for host in os.environ.get("VOICE_SAMPLE_ALLOWED_HOSTS", "").split(",")
-        if host.strip()
-    }
-    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowed_hosts:
-        invalid_job("sample_url_host_or_scheme")
+    if parsed.scheme != "https" or not parsed.hostname or not isinstance(sample_host, str) or not sample_host.strip():
+        invalid_job("sample_url_scheme_or_host")
+    if parsed.hostname.lower() != sample_host.strip().lower():
+        invalid_job("sample_url_host_mismatch")
     if parsed.username or parsed.password:
         invalid_job("sample_url_credentials")
     if not isinstance(sample_filename, str) or Path(sample_filename).suffix.lower() not in {

@@ -14,7 +14,7 @@ This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner sta
 
 The `generate-voice.yml` workflow is restricted to manual/API dispatch on `main`, uses a minimal `GITHUB_TOKEN`, and requests an OIDC identity token. The dispatch caller needs a fine-grained token with Actions: write for this repo; ideally use a GitHub App installation token in the private bridge.
 
-Set repository variable `VOICEBOX_BRIDGE_URL` to the HTTPS base URL of the private bridge. The worker fails closed if unset. Set `VOICE_SAMPLE_ALLOWED_HOSTS` to comma-separated exact hostnames used by the private object store's signed sample URLs. Do not use wildcards.
+Set repository variable `VOICEBOX_BRIDGE_URL` to the HTTPS base URL of the private bridge. The worker fails closed if unset. For voice samples, the authenticated bridge supplies the host alongside its signed URL; the worker requires an exact HTTPS host match. No public host allowlist variable is needed.
 
 The bridge service needs these secrets in its own private host environment, never in this repository:
 

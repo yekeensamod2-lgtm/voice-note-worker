@@ -23,7 +23,6 @@ jobs:
     timeout-minutes: 90
     env:
       VOICEBOX_BRIDGE_URL: ${{ vars.VOICEBOX_BRIDGE_URL }}
-      VOICE_SAMPLE_ALLOWED_HOSTS: ${{ vars.VOICE_SAMPLE_ALLOWED_HOSTS }}
       VOICEBOX_MODELS_DIR: ${{ github.workspace }}/.voicebox-hf
       HF_HUB_DISABLE_TELEMETRY: '1'
       HF_HUB_DISABLE_PROGRESS_BARS: '1'
