@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -173,7 +174,17 @@ def create_profile(sample_path: Path, language: str, reference_text: str) -> str
     return profile_id
 
 
-def generate(profile_id: str, text: str, language: str, output_dir: Path) -> Path:
+def stable_voice_seed(sample_path: Path) -> int:
+    """Keep sampling consistent for one exact private reference recording."""
+    digest = hashlib.sha256()
+    with sample_path.open("rb") as sample:
+        for chunk in iter(lambda: sample.read(1024 * 1024), b""):
+            digest.update(chunk)
+    # Voicebox accepts a non-negative integer seed. Keep it bounded to 31 bits.
+    return int.from_bytes(digest.digest()[:4], "big") & 0x7FFFFFFF
+
+
+def generate(profile_id: str, text: str, language: str, output_dir: Path, seed: int) -> Path:
     response = requests.post(
         f"{VOICEBOX_URL}/generate",
         json={
@@ -182,6 +193,7 @@ def generate(profile_id: str, text: str, language: str, output_dir: Path) -> Pat
             "language": language,
             "engine": "qwen",
             "model_size": "0.6B",
+            "seed": seed,
             "normalize": True,
             "max_chunk_chars": 800,
         },
@@ -315,7 +327,7 @@ def main() -> int:
             process = start_voicebox()
             wait_for_voicebox(process)
             profile_id = create_profile(sample_path, language, reference_text)
-            wav_path = generate(profile_id, text, language, temp_dir)
+            wav_path = generate(profile_id, text, language, temp_dir, stable_voice_seed(sample_path))
             ogg_path = temp_dir / "voice-note.ogg"
             duration = convert_to_ogg_opus(wav_path, ogg_path)
             send_complete(token, ogg_path, duration)
