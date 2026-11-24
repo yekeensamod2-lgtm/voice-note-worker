@@ -1,0 +1,93 @@
+name: Generate private voice note
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Opaque UUID created by the private bridge; never pass message text here
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: voice-note-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      VOICEBOX_BRIDGE_URL: ${{ vars.VOICEBOX_BRIDGE_URL }}
+      VOICE_SAMPLE_ALLOWED_HOSTS: ${{ vars.VOICE_SAMPLE_ALLOWED_HOSTS }}
+      VOICEBOX_MODELS_DIR: ${{ runner.temp }}/voicebox-hf
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Validate opaque job identifier
+        env:
+          VOICE_JOB_ID: ${{ inputs.job_id }}
+        shell: bash
+        run: |
+          if [[ ! "$VOICE_JOB_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo 'Invalid opaque job identifier.'
+            exit 2
+          fi
+
+      - name: Checkout worker
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned Voicebox source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: jamiepine/voicebox
+          ref: 7b570438da7565e849ec08b16a469339985eaf8c
+          path: voicebox-src
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: voicebox-src/backend/requirements.txt
+
+      - name: Restore public Qwen model cache
+        id: qwen-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/voicebox-hf
+          key: voicebox-qwen-0.6b-${{ runner.os }}-v0.6.0
+
+      - name: Install Voicebox CPU backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r voicebox-src/backend/requirements.txt
+          python -m pip install -r worker/requirements.txt
+          python -m pip install --no-deps git+https://github.com/QwenLM/Qwen3-TTS.git
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+
+      - name: Generate and return voice note
+        env:
+          VOICE_JOB_ID: ${{ inputs.job_id }}
+          VOICEBOX_DATA_DIR: ${{ runner.temp }}/voicebox-data
+        run: python worker/run_job.py
+
+      - name: Save Qwen model cache
+        if: success() && steps.qwen-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/voicebox-hf
+          key: voicebox-qwen-0.6b-${{ runner.os }}-v0.6.0

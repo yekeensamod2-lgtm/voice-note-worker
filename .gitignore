@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+voicebox-data/
+voicebox-src/
+*.wav
+*.ogg
+*.opus
+*.mp3

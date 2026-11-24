@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: voice-note-private-bridge
+    runtime: python
+    plan: free
+    region: frankfurt
+    rootDir: bridge
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: BOT_BRIDGE_TOKEN
+        sync: false
+      - key: GITHUB_DISPATCH_TOKEN
+        sync: false
+      - key: GITHUB_REPOSITORY
+        value: yekeensamod2-lgtm/voice-note-worker
+      - key: GITHUB_WORKFLOW_FILE
+        value: generate-voice.yml
+      - key: GITHUB_DEFAULT_BRANCH
+        value: main
