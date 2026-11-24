@@ -84,9 +84,18 @@ def storage_delete(paths: list[str]) -> None:
 
 
 def delete_job(job: dict) -> None:
-    paths = [job.get("sample_path"), job.get("result_path")]
+    # Reusable profile samples live under profiles/ and are intentionally kept.
+    # Legacy per-job samples live under samples/ and expire with their job.
+    sample = str(job.get("sample_path") or "")
+    paths = ([sample] if sample.startswith("samples/") else []) + [job.get("result_path")]
     storage_delete([path for path in paths if path])
     supabase_request("DELETE", f"/rest/v1/voice_note_jobs?id=eq.{job['id']}")
+    if sample.startswith("profiles/"):
+        encoded = quote(sample, safe="")
+        current = supabase_request("GET", f"/rest/v1/voice_note_profiles?sample_path=eq.{encoded}&select=profile_id&limit=1").json()
+        active = table(f"sample_path=eq.{encoded}&select=id&limit=1").json()
+        if not current and not active:
+            storage_delete([sample])
 
 
 def purge_expired() -> None:
@@ -108,6 +117,51 @@ def bot_job(job_id: str) -> dict:
     if not found:
         raise HTTPException(status_code=404, detail="job_not_found")
     return found[0]
+
+
+def current_voice_profile() -> dict | None:
+    response = supabase_request(
+        "GET", "/rest/v1/voice_note_profiles?profile_id=eq.default&select=profile_id,sample_path,language,reference_text,updated_at&limit=1"
+    )
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+def upsert_voice_profile(sample: bytes, filename: str, content_type: str, language: str, reference_text: str) -> None:
+    extension = filename.rsplit(".", 1)[-1].lower()
+    if extension not in {"wav", "mp3", "m4a", "ogg", "opus", "webm", "flac", "aac"}:
+        raise HTTPException(status_code=400, detail="unsupported_audio")
+    if not sample or len(sample) > MAX_SAMPLE_BYTES:
+        raise HTTPException(status_code=413, detail="sample_too_large")
+    if language not in {"en", "zh", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"}:
+        raise HTTPException(status_code=400, detail="unsupported_language")
+    if not reference_text.strip() or len(reference_text) > MAX_REFERENCE_CHARS:
+        raise HTTPException(status_code=400, detail="invalid_reference_text")
+
+    previous = current_voice_profile()
+    object_path = f"profiles/default-{uuid.uuid4()}.{extension}"
+    storage_upload(object_path, sample, content_type or "application/octet-stream")
+    try:
+        supabase_request(
+            "POST",
+            "/rest/v1/voice_note_profiles?on_conflict=profile_id",
+            json={
+                "profile_id": "default",
+                "sample_path": object_path,
+                "language": language,
+                "reference_text": reference_text.strip(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+    except Exception:
+        storage_delete([object_path])
+        raise
+    old_path = str((previous or {}).get("sample_path") or "")
+    if old_path and old_path != object_path:
+        active = table(f"sample_path=eq.{quote(old_path, safe='')}&select=id&limit=1").json()
+        if not active:
+            storage_delete([old_path])
 
 
 def worker_claims(authorization: Annotated[str | None, Header()] = None) -> dict:
@@ -191,37 +245,72 @@ def healthz():
     return {"ok": True, "service": "voice-note-bridge"}
 
 
+@app.get("/v1/profile", dependencies=[Depends(bot_auth)])
+def get_profile_status():
+    profile = current_voice_profile()
+    if not profile:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "language": profile["language"],
+        "updated_at": profile["updated_at"],
+    }
+
+
+@app.put("/v1/profile", dependencies=[Depends(bot_auth)])
+async def save_profile(
+    voice_sample: Annotated[UploadFile, File()],
+    reference_text: Annotated[str, Form()],
+    language: Annotated[str, Form()] = "en",
+):
+    sample = await voice_sample.read(MAX_SAMPLE_BYTES + 1)
+    upsert_voice_profile(
+        sample,
+        voice_sample.filename or "voice-sample.ogg",
+        voice_sample.content_type or "application/octet-stream",
+        language,
+        reference_text,
+    )
+    return {"configured": True, "language": language}
+
+
+@app.delete("/v1/profile", dependencies=[Depends(bot_auth)])
+def delete_profile():
+    profile = current_voice_profile()
+    if not profile:
+        return {"configured": False}
+    supabase_request("DELETE", "/rest/v1/voice_note_profiles?profile_id=eq.default")
+    old_path = str(profile.get("sample_path") or "")
+    active = table(f"sample_path=eq.{quote(old_path, safe='')}&select=id&limit=1").json()
+    if old_path and not active:
+        storage_delete([old_path])
+    return {"configured": False}
+
+
 @app.post("/v1/jobs", dependencies=[Depends(bot_auth)])
 async def create_job(
     text: Annotated[str, Form()],
-    language: Annotated[str, Form()],
-    reference_text: Annotated[str, Form()],
-    voice_sample: Annotated[UploadFile, File()],
+    language: Annotated[str, Form()] = "",
 ):
     if not text.strip() or len(text) > MAX_TEXT_CHARS:
         raise HTTPException(status_code=400, detail="invalid_text")
-    if not reference_text.strip() or len(reference_text) > MAX_REFERENCE_CHARS:
-        raise HTTPException(status_code=400, detail="invalid_reference_text")
-    if language not in {"en", "zh", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"}:
+    profile = current_voice_profile()
+    if not profile:
+        raise HTTPException(status_code=409, detail="voice_profile_not_configured")
+    selected_language = language.strip() or str(profile["language"])
+    if selected_language not in {"en", "zh", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"}:
         raise HTTPException(status_code=400, detail="unsupported_language")
-    extension = (voice_sample.filename or "").rsplit(".", 1)[-1].lower()
-    if extension not in {"wav", "mp3", "m4a", "ogg", "opus", "webm", "flac", "aac"}:
-        raise HTTPException(status_code=400, detail="unsupported_audio")
-    sample = await voice_sample.read(MAX_SAMPLE_BYTES + 1)
-    if not sample or len(sample) > MAX_SAMPLE_BYTES:
-        raise HTTPException(status_code=413, detail="sample_too_large")
 
     purge_expired()
     job_id = str(uuid.uuid4())
-    sample_path = f"samples/{job_id}.{extension}"
-    content_type = voice_sample.content_type or "application/octet-stream"
+    sample_path = str(profile["sample_path"])
     now = datetime.now(timezone.utc)
     record = {
         "id": job_id,
         "status": "pending",
         "text": text,
-        "language": language,
-        "reference_text": reference_text,
+        "language": selected_language,
+        "reference_text": profile["reference_text"],
         "sample_path": sample_path,
         "result_path": None,
         "run_id": None,
@@ -230,7 +319,6 @@ async def create_job(
         "expires_at": (now + timedelta(hours=2)).isoformat(),
     }
     try:
-        storage_upload(sample_path, sample, content_type)
         supabase_request(
             "POST",
             "/rest/v1/voice_note_jobs",
@@ -240,7 +328,6 @@ async def create_job(
         dispatch(job_id)
     except Exception:
         try:
-            storage_delete([sample_path])
             supabase_request("DELETE", f"/rest/v1/voice_note_jobs?id=eq.{job_id}")
         except Exception:
             pass
