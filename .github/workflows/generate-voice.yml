@@ -24,7 +24,7 @@ jobs:
     env:
       VOICEBOX_BRIDGE_URL: ${{ vars.VOICEBOX_BRIDGE_URL }}
       VOICE_SAMPLE_ALLOWED_HOSTS: ${{ vars.VOICE_SAMPLE_ALLOWED_HOSTS }}
-      VOICEBOX_MODELS_DIR: ${{ runner.temp }}/voicebox-hf
+      VOICEBOX_MODELS_DIR: ${{ github.workspace }}/.voicebox-hf
       HF_HUB_DISABLE_TELEMETRY: '1'
       HF_HUB_DISABLE_PROGRESS_BARS: '1'
       PYTHONUNBUFFERED: '1'
@@ -63,7 +63,7 @@ jobs:
         id: qwen-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: ${{ runner.temp }}/voicebox-hf
+          path: ${{ github.workspace }}/.voicebox-hf
           key: voicebox-qwen-0.6b-${{ runner.os }}-v0.6.0
 
       - name: Install Voicebox CPU backend
@@ -89,5 +89,5 @@ jobs:
         if: success() && steps.qwen-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: ${{ runner.temp }}/voicebox-hf
+          path: ${{ github.workspace }}/.voicebox-hf
           key: voicebox-qwen-0.6b-${{ runner.os }}-v0.6.0
