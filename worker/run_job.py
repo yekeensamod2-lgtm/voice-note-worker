@@ -30,6 +30,12 @@ def safe_log(message: str) -> None:
     LOG.info("job=%s %s", JOB_ID[:8], message)
 
 
+def invalid_job(reason: str) -> None:
+    # Keep payload values private; this reason identifies only the rejected field.
+    safe_log(f"job validation failed ({reason})")
+    raise ValueError("invalid_job")
+
+
 def oidc_token() -> str:
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
     request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
@@ -69,13 +75,13 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
     sample_url = job.get("voice_sample_url")
     sample_filename = job.get("voice_sample_filename")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
-        raise ValueError("invalid_job")
+        invalid_job("text")
     if not isinstance(language, str) or not re.fullmatch(r"(en|zh|ja|ko|de|fr|ru|pt|es|it)", language):
-        raise ValueError("invalid_job")
+        invalid_job("language")
     if not isinstance(reference_text, str) or not reference_text.strip() or len(reference_text) > 1000:
-        raise ValueError("invalid_job")
+        invalid_job("reference_text")
     if not isinstance(sample_url, str):
-        raise ValueError("invalid_job")
+        invalid_job("sample_url_missing")
     parsed = urlparse(sample_url)
     allowed_hosts = {
         host.strip().lower()
@@ -83,13 +89,13 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
         if host.strip()
     }
     if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowed_hosts:
-        raise ValueError("invalid_job")
+        invalid_job("sample_url_host_or_scheme")
     if parsed.username or parsed.password:
-        raise ValueError("invalid_job")
+        invalid_job("sample_url_credentials")
     if not isinstance(sample_filename, str) or Path(sample_filename).suffix.lower() not in {
         ".wav", ".mp3", ".m4a", ".ogg", ".opus", ".webm", ".flac", ".aac"
     }:
-        raise ValueError("invalid_job")
+        invalid_job("sample_filename")
     return text, language, reference_text, sample_url, sample_filename
 
 
@@ -99,7 +105,7 @@ def download_sample(url: str, path: Path) -> None:
         raise RuntimeError("sample_unavailable")
     length = response.headers.get("Content-Length")
     if length and int(length) > MAX_SAMPLE_BYTES:
-        raise ValueError("invalid_job")
+        invalid_job("sample_size")
     total = 0
     with path.open("wb") as output:
         for chunk in response.iter_content(1024 * 256):
@@ -107,7 +113,7 @@ def download_sample(url: str, path: Path) -> None:
                 continue
             total += len(chunk)
             if total > MAX_SAMPLE_BYTES:
-                raise ValueError("invalid_job")
+                invalid_job("sample_size")
             output.write(chunk)
     if total == 0:
         raise RuntimeError("sample_unavailable")
