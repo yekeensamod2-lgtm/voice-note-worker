@@ -100,6 +100,7 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
 def download_sample(url: str, path: Path) -> None:
     response = requests.get(url, stream=True, timeout=(15, 90), allow_redirects=False)
     if response.status_code != 200:
+        safe_log(f"sample download returned HTTP {response.status_code}")
         raise RuntimeError("sample_unavailable")
     length = response.headers.get("Content-Length")
     if length and int(length) > MAX_SAMPLE_BYTES:

@@ -213,8 +213,12 @@ def signed_sample_url(object_path: str) -> str:
     signed = response.json().get("signedURL")
     if not isinstance(signed, str):
         raise RuntimeError("signed_url_error")
-    if signed.startswith("/"):
+    if signed.startswith("/storage/v1/"):
         signed = setting("SUPABASE_URL").rstrip("/") + signed
+    elif signed.startswith("/"):
+        # Storage API returns a path relative to its own base (/object/sign/...),
+        # while the project URL stops before /storage/v1.
+        signed = setting("SUPABASE_URL").rstrip("/") + "/storage/v1" + signed
     parsed = urlparse(signed)
     if parsed.scheme != "https" or parsed.hostname != urlparse(setting("SUPABASE_URL")).hostname:
         raise RuntimeError("signed_url_error")
