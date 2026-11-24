@@ -62,7 +62,7 @@ def storage_upload(object_path: str, data: bytes, content_type: str) -> None:
     supabase_request(
         "POST",
         storage_path(object_path),
-        content=data,
+        data=data,
         headers={"Content-Type": content_type, "x-upsert": "false"},
     )
 
