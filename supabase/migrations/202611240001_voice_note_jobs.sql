@@ -27,7 +27,7 @@ values (
   'voicebox-private',
   false,
   125829120,
-  array['audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/opus', 'audio/webm', 'audio/flac', 'audio/aac', 'application/octet-stream']
+  array['audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/opus', 'audio/webm', 'audio/flac', 'audio/aac', 'application/octet-stream', 'application/zip']
 )
 on conflict (id) do update
 set public = false,

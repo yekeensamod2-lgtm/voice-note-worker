@@ -397,6 +397,9 @@ def send_complete(token: str, audio_path: Path, duration: float, content_type: s
             data={"duration_seconds": f"{duration:.2f}"},
         )
     if response.status_code not in (200, 204):
+        # Keep response bodies private; the status is enough to troubleshoot
+        # bridge-side rejection without risking message or infrastructure data.
+        safe_log(f"bridge completion rejected (HTTP {response.status_code})")
         raise RuntimeError("bridge_complete_failed")
 
 
