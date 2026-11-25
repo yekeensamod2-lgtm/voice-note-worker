@@ -1,6 +1,6 @@
 # Voice note worker (GitHub-hosted Actions + Voicebox/Qwen)
 
-This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner starts on demand, runs Voicebox with Qwen3-TTS 1.7B for higher voice-cloning quality, and returns generated Ogg/Opus audio through a private bridge. Voicebox is never installed on the bot PC.
+This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner starts on demand, loads Voicebox with Qwen3-TTS 1.7B once, generates one or more sentence-aligned Ogg/Opus clips, and returns them as a private ZIP bundle through the bridge. Voicebox is never installed on the bot PC.
 
 ## Data boundary
 
@@ -30,19 +30,19 @@ Bot-side endpoints (Bearer `BOT_BRIDGE_TOKEN`):
 
 - `POST /v1/jobs` multipart fields `text`, `language`, `reference_text`, `voice_sample` (audio). Stores a private job/sample, dispatches the workflow with only the new UUID, returns `{job_id}`.
 - `GET /v1/jobs/{job_id}` returns status only.
-- `GET /v1/jobs/{job_id}/result` streams Ogg/Opus to the bot once, then deletes job and private sample/result objects.
+- `GET /v1/jobs/{job_id}/result` streams Ogg/Opus or a clip ZIP to the bot once, then deletes job and private sample/result objects.
 
 Runner endpoints (Bearer GitHub OIDC JWT, audience `voicebox-bridge`):
 
 - `POST /v1/jobs/{job_id}/claim` atomically claims one pending job; returns text, language, reference text, and an expiring signed sample URL. Reject repeats and wrong workflow/ref/repository.
-- `POST /v1/jobs/{job_id}/complete` multipart `audio` plus `duration_seconds`; persists the private result and marks complete.
+- `POST /v1/jobs/{job_id}/complete` multipart `audio` (Ogg/Opus or ZIP) plus total `duration_seconds`; persists the private result and marks complete.
 - `POST /v1/jobs/{job_id}/fail` JSON `{code: ...}`; accepts only an allowlisted non-sensitive error code.
 
 Never return message text or audio in status responses. Expire abandoned jobs and delete their private objects. Configure the bridge and storage for HTTPS only.
 
 ## Limits and expectations
 
-The Qwen 1.7B cache is a performance optimization, not permanent storage; GitHub can evict it. A cache miss downloads roughly 3.5 GB of model weights, with about 6 GB of model memory required. Downloads and caches stay on GitHub-hosted runners; no model or package downloads run on the bot PC. Each Actions run is a fresh CPU runner, so the model must be loaded again each time; there is no warm in-memory model across jobs. The workflow has a 90-minute timeout. The bridge should surface `queued`, `processing`, `ready`, and safe failure states to Telegram.
+The Qwen 1.7B cache is a performance optimization, not permanent storage; GitHub can evict it. A cache miss downloads roughly 3.5 GB of model weights, with about 6 GB of model memory required. Downloads and caches stay on GitHub-hosted runners; no model or package downloads run on the bot PC. Each Actions run is a fresh CPU runner, so the model must be loaded again each time; there is no warm in-memory model across jobs. Multi-clip messages are synthesized sequentially in one run, reusing that model and temporary voice profile. Gemini supplies exact sentence units and duration estimates; the worker may split an overlong clip only between those sentence units. A sentence that alone exceeds the target duration remains intact. The workflow has a 90-minute timeout. The bridge should surface `queued`, `processing`, `ready`, and safe failure states to Telegram.
 
 ## Voicebox source
 

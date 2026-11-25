@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,6 +27,10 @@ VOICEBOX_URL = "http://127.0.0.1:17493"
 MAX_TEXT_CHARS = 12_000
 MAX_SAMPLE_BYTES = 25 * 1024 * 1024
 MAX_AUDIO_BYTES = 120 * 1024 * 1024
+MAX_VOICE_CLIPS = 20
+MAX_CLIP_SECONDS = 45.0
+CLIP_PLAN_PREFIX = "ASTRA_VOICE_CLIP_PLAN_V1\n"
+CLIP_PLAN_FORMAT = "astra-voice-clip-plan-v1"
 
 
 def safe_log(message: str) -> None:
@@ -96,6 +102,56 @@ def validate_job(job: dict) -> tuple[str, str, str, str, str]:
     }:
         invalid_job("sample_filename")
     return text, language, reference_text, sample_url, sample_filename
+
+
+def _normalize_spoken_text(text: str) -> str:
+    return " ".join(re.sub(r"\{br\}", " ", str(text or ""), flags=re.I).split())
+
+
+def decode_clip_plan(text: str) -> tuple[dict, bool]:
+    """Validate an Astra Gemini plan, or safely treat a legacy request as one clip."""
+    if not text.startswith(CLIP_PLAN_PREFIX):
+        source = _normalize_spoken_text(text)
+        if not source:
+            invalid_job("text")
+        return {
+            "format": CLIP_PLAN_FORMAT,
+            "source_text": source,
+            "clips": [{"sentences": [{"text": source, "estimated_seconds": max(1.0, len(source.split()) / 2.3)}]}],
+        }, False
+    try:
+        plan = json.loads(text[len(CLIP_PLAN_PREFIX):])
+    except (json.JSONDecodeError, TypeError):
+        invalid_job("clip_plan_json")
+    if not isinstance(plan, dict) or plan.get("format") != CLIP_PLAN_FORMAT:
+        invalid_job("clip_plan_format")
+    source = _normalize_spoken_text(plan.get("source_text", ""))
+    clips = plan.get("clips")
+    if not source or not isinstance(clips, list) or not 1 <= len(clips) <= MAX_VOICE_CLIPS:
+        invalid_job("clip_plan_shape")
+    sentences = []
+    clean_clips = []
+    for clip in clips:
+        units = clip.get("sentences") if isinstance(clip, dict) else None
+        if not isinstance(units, list) or not units:
+            invalid_job("clip_plan_sentences")
+        clean_units = []
+        for unit in units:
+            if not isinstance(unit, dict):
+                invalid_job("clip_plan_sentence")
+            sentence = _normalize_spoken_text(unit.get("text", ""))
+            estimate = unit.get("estimated_seconds")
+            if not sentence or not isinstance(estimate, (int, float)) or isinstance(estimate, bool) or not 0 < float(estimate) <= 600:
+                invalid_job("clip_plan_sentence")
+            clean_units.append({"text": sentence, "estimated_seconds": float(estimate)})
+            sentences.append(sentence)
+        clean_clips.append({"sentences": clean_units})
+    if _normalize_spoken_text(" ".join(sentences)) != source:
+        invalid_job("clip_plan_changed_text")
+    for sentence in sentences[:-1]:
+        if not re.search(r"[.!?…](?:[\"'’”\)\]}]*)(?:[\U0001F000-\U0001FAFF\uFE0F\u200D])*\s*$", sentence):
+            invalid_job("clip_plan_split_sentence")
+    return {"format": CLIP_PLAN_FORMAT, "source_text": source, "clips": clean_clips}, True
 
 
 def download_sample(url: str, path: Path) -> None:
@@ -274,13 +330,70 @@ def convert_to_ogg_opus(wav_path: Path, ogg_path: Path) -> float:
     return duration
 
 
-def send_complete(token: str, ogg_path: Path, duration: float) -> None:
-    with ogg_path.open("rb") as audio:
+def split_sentence_units(units: list[dict]) -> list[list[dict]]:
+    """Choose the sentence boundary closest to half the estimate for a long clip."""
+    if len(units) < 2:
+        return [units]
+    total = sum(float(unit["estimated_seconds"]) for unit in units)
+    running = 0.0
+    candidates = []
+    for index in range(1, len(units)):
+        running += float(units[index - 1]["estimated_seconds"])
+        candidates.append((abs(total / 2 - running), index))
+    _, split_at = min(candidates)
+    return [units[:split_at], units[split_at:]]
+
+
+def generate_clip_bundle(profile_id: str, plan: dict, language: str, output_dir: Path, seed: int) -> tuple[Path, float, int]:
+    pending = list(plan["clips"])
+    generated = []
+    while pending:
+        clip = pending.pop(0)
+        units = clip["sentences"]
+        text = " ".join(unit["text"] for unit in units)
+        attempt_dir = output_dir / f"attempt-{uuid.uuid4().hex}"
+        attempt_dir.mkdir(parents=True, exist_ok=False)
+        wav_path = generate(profile_id, text, language, attempt_dir, seed)
+        ogg_path = attempt_dir / "voice-note.ogg"
+        duration = convert_to_ogg_opus(wav_path, ogg_path)
+        current_total = len(generated) + len(pending)
+        if duration > MAX_CLIP_SECONDS and len(units) > 1 and current_total + 2 <= MAX_VOICE_CLIPS:
+            left, right = split_sentence_units(units)
+            # Re-generate only as sentence-aligned clips; never split a sentence
+            # to force an audio-duration limit.
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            pending = [{"sentences": left}, {"sentences": right}] + pending
+            continue
+        generated.append({"directory": attempt_dir, "path": ogg_path, "text": text, "duration_seconds": duration})
+        if len(generated) > MAX_VOICE_CLIPS:
+            raise ValueError("too_many_voice_clips")
+
+    total_duration = sum(item["duration_seconds"] for item in generated)
+    if total_duration > 1200:
+        raise RuntimeError("audio_validation_failed")
+    manifest = {
+        "version": 1,
+        "source_text": plan["source_text"],
+        "clips": [{"file": f"clip-{index:02d}.ogg", "text": item["text"], "duration_seconds": round(item["duration_seconds"], 2)} for index, item in enumerate(generated, 1)],
+    }
+    archive_path = output_dir / "voice-notes.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for index, item in enumerate(generated, 1):
+            archive.write(item["path"], arcname=f"clip-{index:02d}.ogg")
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
+    if archive_path.stat().st_size > MAX_AUDIO_BYTES:
+        raise RuntimeError("audio_too_large")
+    return archive_path, total_duration, len(generated)
+
+
+def send_complete(token: str, audio_path: Path, duration: float, content_type: str = "audio/ogg") -> None:
+    extension = ".zip" if content_type == "application/zip" else ".ogg"
+    with audio_path.open("rb") as audio:
         response = bridge_call(
             "POST",
             f"/v1/jobs/{JOB_ID}/complete",
             token,
-            files={"audio": ("voice-note.ogg", audio, "audio/ogg")},
+            files={"audio": (f"voice-notes{extension}", audio, content_type)},
             data={"duration_seconds": f"{duration:.2f}"},
         )
     if response.status_code not in (200, 204):
@@ -320,6 +433,7 @@ def main() -> int:
             raise RuntimeError("job_claim_failed")
         job = claim.json()
         text, language, reference_text, sample_url, sample_filename = validate_job(job)
+        clip_plan, planned = decode_clip_plan(text)
         with tempfile.TemporaryDirectory(prefix="voicebox-job-") as temp:
             temp_dir = Path(temp)
             sample_path = temp_dir / sample_filename
@@ -327,10 +441,16 @@ def main() -> int:
             process = start_voicebox()
             wait_for_voicebox(process)
             profile_id = create_profile(sample_path, language, reference_text)
-            wav_path = generate(profile_id, text, language, temp_dir, stable_voice_seed(sample_path))
-            ogg_path = temp_dir / "voice-note.ogg"
-            duration = convert_to_ogg_opus(wav_path, ogg_path)
-            send_complete(token, ogg_path, duration)
+            seed = stable_voice_seed(sample_path)
+            if planned:
+                bundle_path, duration, clip_count = generate_clip_bundle(profile_id, clip_plan, language, temp_dir, seed)
+                send_complete(token, bundle_path, duration, "application/zip")
+                safe_log(f"completed {clip_count} voice clip(s); total_seconds={duration:.1f}")
+            else:
+                wav_path = generate(profile_id, clip_plan["source_text"], language, temp_dir, seed)
+                ogg_path = temp_dir / "voice-note.ogg"
+                duration = convert_to_ogg_opus(wav_path, ogg_path)
+                send_complete(token, ogg_path, duration)
         safe_log("completed audio generation and private upload")
         return 0
     except Exception as exc:

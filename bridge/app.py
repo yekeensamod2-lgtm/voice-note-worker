@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hmac
+import io
 import os
 import re
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from urllib.parse import quote, urlparse
@@ -361,11 +363,12 @@ def get_result(job_id: str, background: BackgroundTasks):
     except Exception:
         raise HTTPException(status_code=502, detail="result_unavailable") from None
     background.add_task(delete_job, job)
+    bundled = str(job["result_path"]).lower().endswith(".zip")
     return Response(
         content=audio,
-        media_type="audio/ogg",
+        media_type="application/zip" if bundled else "audio/ogg",
         headers={
-            "Content-Disposition": f'attachment; filename="voice-note-{job_id[:8]}.ogg"',
+            "Content-Disposition": f'attachment; filename="voice-notes-{job_id[:8]}.zip"' if bundled else f'attachment; filename="voice-note-{job_id[:8]}.ogg"',
             "Cache-Control": "no-store",
         },
     )
@@ -403,14 +406,17 @@ async def complete_job(
     claims: dict = Depends(worker_claims),
 ):
     job = require_job_run(job_id, claims)
-    if audio.content_type != "audio/ogg" or not 0 < duration_seconds <= 600:
+    if audio.content_type not in {"audio/ogg", "application/zip"} or not 0 < duration_seconds <= 1200:
         raise HTTPException(status_code=400, detail="invalid_audio")
     content = await audio.read(MAX_OUTPUT_BYTES + 1)
     if not content or len(content) > MAX_OUTPUT_BYTES:
         raise HTTPException(status_code=413, detail="audio_too_large")
-    result_path = f"results/{job_id}.ogg"
+    bundled = audio.content_type == "application/zip"
+    if bundled and not zipfile.is_zipfile(io.BytesIO(content)):
+        raise HTTPException(status_code=400, detail="invalid_audio")
+    result_path = f"results/{job_id}.zip" if bundled else f"results/{job_id}.ogg"
     try:
-        storage_upload(result_path, content, "audio/ogg")
+        storage_upload(result_path, content, "application/zip" if bundled else "audio/ogg")
         updated = supabase_request(
             "PATCH",
             f"/rest/v1/voice_note_jobs?id=eq.{job_id}&status=eq.processing&run_id=eq.{claims['run_id']}",
