@@ -22,23 +22,21 @@ runs:
       with:
         path: |
           .venv
-          .ffmpeg-data
-        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-ffmpeg8.1.1-v2-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}
+        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-v3-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}
 
     - name: Validate or create virtual environment
       id: python-env
       shell: bash
       run: |
         set -euo pipefail
-        if [[ -x .venv/bin/python ]] && .venv/bin/python -c 'import fastapi, ffmpeg_downloader, qwen_tts, requests, torch; assert torch.version.cuda is None and torch.version.hip is None' >/dev/null 2>&1; then
+        if [[ -x .venv/bin/python ]] && .venv/bin/python -c 'import fastapi, qwen_tts, requests, torch; assert torch.version.cuda is None and torch.version.hip is None' >/dev/null 2>&1; then
           echo 'cache_valid=true' >> "$GITHUB_OUTPUT"
         else
-          rm -rf .venv .ffmpeg-data
+          rm -rf .venv
           python -m venv .venv
           echo 'cache_valid=false' >> "$GITHUB_OUTPUT"
         fi
         echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-        echo "XDG_DATA_HOME=$GITHUB_WORKSPACE/.ffmpeg-data" >> "$GITHUB_ENV"
 
     - name: Install CPU-only Voicebox dependencies
       if: steps.python-env.outputs.cache_valid != 'true'
@@ -53,22 +51,25 @@ runs:
         python -m pip install --disable-pip-version-check --no-deps \
           'git+https://github.com/QwenLM/Qwen3-TTS.git@022e286b98fbec7e1e916cb940cdf532cd9f488e'
         python -m pip install --disable-pip-version-check -r worker/requirements.txt
-        python -m ffmpeg_downloader install 8.1.1@gpl
         python -m pip check
         python -c 'import torch; assert torch.version.cuda is None and torch.version.hip is None; print("CPU-only PyTorch environment ready")'
-        python -c 'import ffmpeg_downloader as f; print("Cached FFmpeg:", f.ffmpeg_version, f.ffmpeg_path); print("Cached FFprobe:", f.ffprobe_path)'
 
-    - name: Validate cached FFmpeg and Opus encoder
+    - name: Ensure FFmpeg is available on the GitHub runner
       shell: bash
       run: |
         set -euo pipefail
-        bin_dir="$(python -c 'import ffmpeg_downloader as f; print(f.ffmpeg_dir)')"
-        ffmpeg_path="$(python -c 'import ffmpeg_downloader as f; print(f.ffmpeg_path)')"
-        ffprobe_path="$(python -c 'import ffmpeg_downloader as f; print(f.ffprobe_path)')"
-        test -x "$ffmpeg_path"
-        test -x "$ffprobe_path"
-        "$ffmpeg_path" -hide_banner -encoders 2>/dev/null | grep -qE '^[[:space:]]*A[^[:space:]]*[[:space:]]+libopus[[:space:]]'
-        echo "$bin_dir" >> "$GITHUB_PATH"
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+        fi
+
+    - name: Validate FFmpeg and Opus encoder
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v ffmpeg >/dev/null
+        command -v ffprobe >/dev/null
+        ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '^[[:space:]]*A[^[:space:]]*[[:space:]]+libopus[[:space:]]'
 
     - name: Save installed Python environment
       if: success() && steps.python-env.outputs.cache_valid != 'true' && steps.python-env-cache.outputs.cache-hit != 'true'
@@ -76,5 +77,4 @@ runs:
       with:
         path: |
           .venv
-          .ffmpeg-data
-        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-ffmpeg8.1.1-v2-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}
+        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-v3-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}

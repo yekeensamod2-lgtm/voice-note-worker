@@ -7,7 +7,7 @@ This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner sta
 - The workflow input is only an opaque UUID. It never contains message text, profile audio, or generated audio.
 - The worker authenticates to the bridge with a GitHub Actions OIDC token. The bridge must validate GitHub's JWT signature and require this repository, `workflow_dispatch`, the default branch, and this workflow file.
 - The bridge delivers the text and a short-lived URL for the voice reference sample only after OIDC validation. The runner uploads generated audio directly to the bridge.
-- Do not upload audio as an Actions artifact, print payloads, or put profile samples in the Actions cache. The only cache is public Qwen model weights and pip package downloads.
+- Do not upload audio as an Actions artifact, print payloads, or put profile samples in the Actions cache. The Actions caches contain only public Qwen model weights and the CPU-only Python environment.
 - The bridge owns the durable private queue/storage and bot authentication. Its deployment and credentials are separate from this public repository.
 
 ## Workflow setup
