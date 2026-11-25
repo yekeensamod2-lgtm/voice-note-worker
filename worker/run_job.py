@@ -192,7 +192,7 @@ def generate(profile_id: str, text: str, language: str, output_dir: Path, seed: 
             "text": text,
             "language": language,
             "engine": "qwen",
-            "model_size": "0.6B",
+            "model_size": "1.7B",
             "seed": seed,
             "normalize": True,
             "max_chunk_chars": 800,

@@ -1,6 +1,6 @@
 # Voice note worker (GitHub-hosted Actions + Voicebox/Qwen)
 
-This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner starts on demand, runs Voicebox with Qwen3-TTS 0.6B, and returns generated Ogg/Opus audio through a private bridge. Voicebox is never installed on the bot PC.
+This repository is a public, code-only worker. A GitHub-hosted Ubuntu runner starts on demand, runs Voicebox with Qwen3-TTS 1.7B for higher voice-cloning quality, and returns generated Ogg/Opus audio through a private bridge. Voicebox is never installed on the bot PC.
 
 ## Data boundary
 
@@ -42,7 +42,7 @@ Never return message text or audio in status responses. Expire abandoned jobs an
 
 ## Limits and expectations
 
-The Qwen cache is a performance optimization, not permanent storage; GitHub can evict it. A cache miss downloads roughly 1.2 GB of model weights. Each Actions run is a fresh CPU runner, so the model must be loaded again each time; there is no warm in-memory model across jobs. The workflow has a 90-minute timeout. The bridge should surface `queued`, `processing`, `ready`, and safe failure states to Telegram.
+The Qwen 1.7B cache is a performance optimization, not permanent storage; GitHub can evict it. A cache miss downloads roughly 3.5 GB of model weights, with about 6 GB of model memory required. Downloads and caches stay on GitHub-hosted runners; no model or package downloads run on the bot PC. Each Actions run is a fresh CPU runner, so the model must be loaded again each time; there is no warm in-memory model across jobs. The workflow has a 90-minute timeout. The bridge should surface `queued`, `processing`, `ready`, and safe failure states to Telegram.
 
 ## Voicebox source
 

@@ -1,0 +1,80 @@
+name: Prepare cached Voicebox CPU environment
+description: Restore or build the pinned CPU-only Qwen/Voicebox Python environment.
+runs:
+  using: composite
+  steps:
+    - name: Checkout pinned Voicebox source
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      with:
+        repository: jamiepine/voicebox
+        ref: 7b570438da7565e849ec08b16a469339985eaf8c
+        path: voicebox-src
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      with:
+        python-version: '3.12.16'
+
+    - name: Restore installed Python environment
+      id: python-env-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: |
+          .venv
+          .ffmpeg-data
+        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-ffmpeg8.1.1-v2-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}
+
+    - name: Validate or create virtual environment
+      id: python-env
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -x .venv/bin/python ]] && .venv/bin/python -c 'import fastapi, ffmpeg_downloader, qwen_tts, requests, torch; assert torch.version.cuda is None and torch.version.hip is None' >/dev/null 2>&1; then
+          echo 'cache_valid=true' >> "$GITHUB_OUTPUT"
+        else
+          rm -rf .venv .ffmpeg-data
+          python -m venv .venv
+          echo 'cache_valid=false' >> "$GITHUB_OUTPUT"
+        fi
+        echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+        echo "XDG_DATA_HOME=$GITHUB_WORKSPACE/.ffmpeg-data" >> "$GITHUB_ENV"
+
+    - name: Install CPU-only Voicebox dependencies
+      if: steps.python-env.outputs.cache_valid != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -m pip install --disable-pip-version-check \
+          --index-url https://download.pytorch.org/whl/cpu \
+          --extra-index-url https://pypi.org/simple \
+          'torch==2.15.0+cpu' 'torchaudio==2.11.1+cpu'
+        python -m pip install --disable-pip-version-check -r voicebox-src/backend/requirements.txt
+        python -m pip install --disable-pip-version-check --no-deps \
+          'git+https://github.com/QwenLM/Qwen3-TTS.git@022e286b98fbec7e1e916cb940cdf532cd9f488e'
+        python -m pip install --disable-pip-version-check -r worker/requirements.txt
+        python -m ffmpeg_downloader install 8.1.1@gpl
+        python -m pip check
+        python -c 'import torch; assert torch.version.cuda is None and torch.version.hip is None; print("CPU-only PyTorch environment ready")'
+        python -c 'import ffmpeg_downloader as f; print("Cached FFmpeg:", f.ffmpeg_version, f.ffmpeg_path); print("Cached FFprobe:", f.ffprobe_path)'
+
+    - name: Validate cached FFmpeg and Opus encoder
+      shell: bash
+      run: |
+        set -euo pipefail
+        bin_dir="$(python -c 'import ffmpeg_downloader as f; print(f.ffmpeg_dir)')"
+        ffmpeg_path="$(python -c 'import ffmpeg_downloader as f; print(f.ffmpeg_path)')"
+        ffprobe_path="$(python -c 'import ffmpeg_downloader as f; print(f.ffprobe_path)')"
+        test -x "$ffmpeg_path"
+        test -x "$ffprobe_path"
+        "$ffmpeg_path" -hide_banner -encoders 2>/dev/null | grep -qE '^[[:space:]]*A[^[:space:]]*[[:space:]]+libopus[[:space:]]'
+        echo "$bin_dir" >> "$GITHUB_PATH"
+
+    - name: Save installed Python environment
+      if: success() && steps.python-env.outputs.cache_valid != 'true' && steps.python-env-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: |
+          .venv
+          .ffmpeg-data
+        key: voicebox-pyenv-${{ runner.os }}-ubuntu24-py3.12.16-cpu-ffmpeg8.1.1-v2-vbox-7b570438-qwen-022e286b-${{ hashFiles('voicebox-src/backend/requirements.txt', 'worker/requirements.txt') }}

@@ -1,1 +1,2 @@
 requests>=2.31,<3
+ffmpeg-downloader==0.5.3
