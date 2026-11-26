@@ -406,6 +406,9 @@ def generate_clip_bundle(profile_id: str, plan: dict, language: str, output_dir:
 
 
 def send_complete(token: str, audio_path: Path, duration: float, content_type: str = "audio/ogg") -> None:
+    # GitHub OIDC tokens are short-lived. Model setup and synthesis can take
+    # several minutes, so use a fresh token for the result upload.
+    token = oidc_token()
     extension = ".zip" if content_type == "application/zip" else ".ogg"
     with audio_path.open("rb") as audio:
         response = bridge_call(
@@ -426,6 +429,8 @@ def send_failure(token: str, code: str) -> None:
     if not token or not BRIDGE or not JOB_ID:
         return
     try:
+        # The token used to claim the job may have expired while processing.
+        token = oidc_token()
         bridge_call(
             "POST",
             f"/v1/jobs/{JOB_ID}/fail",
