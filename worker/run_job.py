@@ -75,33 +75,49 @@ def bridge_call(method: str, path: str, token: str, **kwargs) -> requests.Respon
     return response
 
 
-def validate_job(job: dict) -> tuple[str, str, str, str, str]:
+def validate_job(job: dict) -> tuple[str, str, list[tuple[str, str, str]]]:
     text = job.get("text")
     language = job.get("language")
-    reference_text = job.get("reference_text")
-    sample_url = job.get("voice_sample_url")
-    sample_host = job.get("voice_sample_host")
-    sample_filename = job.get("voice_sample_filename")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
         invalid_job("text")
     if not isinstance(language, str) or not re.fullmatch(r"(en|zh|ja|ko|de|fr|ru|pt|es|it)", language):
         invalid_job("language")
-    if not isinstance(reference_text, str) or not reference_text.strip() or len(reference_text) > 1000:
-        invalid_job("reference_text")
-    if not isinstance(sample_url, str):
-        invalid_job("sample_url_missing")
-    parsed = urlparse(sample_url)
-    if parsed.scheme != "https" or not parsed.hostname or not isinstance(sample_host, str) or not sample_host.strip():
-        invalid_job("sample_url_scheme_or_host")
-    if parsed.hostname.lower() != sample_host.strip().lower():
-        invalid_job("sample_url_host_mismatch")
-    if parsed.username or parsed.password:
-        invalid_job("sample_url_credentials")
-    if not isinstance(sample_filename, str) or Path(sample_filename).suffix.lower() not in {
-        ".wav", ".mp3", ".m4a", ".ogg", ".opus", ".webm", ".flac", ".aac"
-    }:
-        invalid_job("sample_filename")
-    return text, language, reference_text, sample_url, sample_filename
+    samples = job.get("voice_samples")
+    if not isinstance(samples, list) or not samples:
+        # Compatibility with bridge payloads created before multi-sample support.
+        samples = [{
+            "reference_text": job.get("reference_text"),
+            "voice_sample_url": job.get("voice_sample_url"),
+            "voice_sample_host": job.get("voice_sample_host"),
+            "voice_sample_filename": job.get("voice_sample_filename"),
+        }]
+    if not 1 <= len(samples) <= 5:
+        invalid_job("sample_count")
+    validated: list[tuple[str, str, str]] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            invalid_job("sample_record")
+        reference_text = sample.get("reference_text")
+        sample_url = sample.get("voice_sample_url")
+        sample_host = sample.get("voice_sample_host")
+        sample_filename = sample.get("voice_sample_filename")
+        if not isinstance(reference_text, str) or not reference_text.strip() or len(reference_text) > 1000:
+            invalid_job("reference_text")
+        if not isinstance(sample_url, str):
+            invalid_job("sample_url_missing")
+        parsed = urlparse(sample_url)
+        if parsed.scheme != "https" or not parsed.hostname or not isinstance(sample_host, str) or not sample_host.strip():
+            invalid_job("sample_url_scheme_or_host")
+        if parsed.hostname.lower() != sample_host.strip().lower():
+            invalid_job("sample_url_host_mismatch")
+        if parsed.username or parsed.password:
+            invalid_job("sample_url_credentials")
+        if not isinstance(sample_filename, str) or Path(sample_filename).suffix.lower() not in {
+            ".wav", ".mp3", ".m4a", ".ogg", ".opus", ".webm", ".flac", ".aac"
+        }:
+            invalid_job("sample_filename")
+        validated.append((sample_url, sample_filename, reference_text))
+    return text, language, validated
 
 
 def _normalize_spoken_text(text: str) -> str:
@@ -207,7 +223,7 @@ def wait_for_voicebox(process: subprocess.Popen) -> None:
     raise TimeoutError("voicebox_start_timeout")
 
 
-def create_profile(sample_path: Path, language: str, reference_text: str) -> str:
+def create_profile(samples: list[tuple[Path, str]], language: str) -> str:
     profile = requests.post(
         f"{VOICEBOX_URL}/profiles",
         json={"name": "Temporary job voice", "language": language, "voice_type": "cloned", "default_engine": "qwen"},
@@ -218,24 +234,27 @@ def create_profile(sample_path: Path, language: str, reference_text: str) -> str
     profile_id = profile.json().get("id")
     if not profile_id:
         raise RuntimeError("profile_create_failed")
-    with sample_path.open("rb") as audio:
-        added = requests.post(
-            f"{VOICEBOX_URL}/profiles/{profile_id}/samples",
-            files={"file": (sample_path.name, audio, "application/octet-stream")},
-            data={"reference_text": reference_text},
-            timeout=(20, 180),
-        )
-    if added.status_code not in (200, 201):
-        raise RuntimeError("profile_sample_failed")
+    for sample_path, reference_text in samples:
+        with sample_path.open("rb") as audio:
+            added = requests.post(
+                f"{VOICEBOX_URL}/profiles/{profile_id}/samples",
+                files={"file": (sample_path.name, audio, "application/octet-stream")},
+                data={"reference_text": reference_text},
+                timeout=(20, 180),
+            )
+        if added.status_code not in (200, 201):
+            raise RuntimeError("profile_sample_failed")
     return profile_id
 
 
-def stable_voice_seed(sample_path: Path) -> int:
-    """Keep sampling consistent for one exact private reference recording."""
+def stable_voice_seed(sample_paths: list[Path]) -> int:
+    """Keep sampling consistent for this exact set of private reference recordings."""
     digest = hashlib.sha256()
-    with sample_path.open("rb") as sample:
-        for chunk in iter(lambda: sample.read(1024 * 1024), b""):
-            digest.update(chunk)
+    for sample_path in sample_paths:
+        digest.update(sample_path.name.encode("utf-8"))
+        with sample_path.open("rb") as sample:
+            for chunk in iter(lambda: sample.read(1024 * 1024), b""):
+                digest.update(chunk)
     # Voicebox accepts a non-negative integer seed. Keep it bounded to 31 bits.
     return int.from_bytes(digest.digest()[:4], "big") & 0x7FFFFFFF
 
@@ -435,16 +454,21 @@ def main() -> int:
         if claim.status_code != 200:
             raise RuntimeError("job_claim_failed")
         job = claim.json()
-        text, language, reference_text, sample_url, sample_filename = validate_job(job)
+        text, language, sample_records = validate_job(job)
         clip_plan, planned = decode_clip_plan(text)
         with tempfile.TemporaryDirectory(prefix="voicebox-job-") as temp:
             temp_dir = Path(temp)
-            sample_path = temp_dir / sample_filename
-            download_sample(sample_url, sample_path)
+            sample_paths: list[Path] = []
+            profile_samples: list[tuple[Path, str]] = []
+            for index, (sample_url, sample_filename, reference_text) in enumerate(sample_records, 1):
+                sample_path = temp_dir / f"sample-{index:02d}{Path(sample_filename).suffix.lower()}"
+                download_sample(sample_url, sample_path)
+                sample_paths.append(sample_path)
+                profile_samples.append((sample_path, reference_text))
             process = start_voicebox()
             wait_for_voicebox(process)
-            profile_id = create_profile(sample_path, language, reference_text)
-            seed = stable_voice_seed(sample_path)
+            profile_id = create_profile(profile_samples, language)
+            seed = stable_voice_seed(sample_paths)
             if planned:
                 bundle_path, duration, clip_count = generate_clip_bundle(profile_id, clip_plan, language, temp_dir, seed)
                 send_complete(token, bundle_path, duration, "application/zip")

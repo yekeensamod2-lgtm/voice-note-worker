@@ -21,6 +21,7 @@ BUCKET = "voicebox-private"
 MAX_TEXT_CHARS = 12_000
 MAX_REFERENCE_CHARS = 1_000
 MAX_SAMPLE_BYTES = 25 * 1024 * 1024
+MAX_PROFILE_SAMPLES = 5
 MAX_OUTPUT_BYTES = 120 * 1024 * 1024
 JOB_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 OIDC_AUDIENCE = "voicebox-bridge"
@@ -89,20 +90,25 @@ def delete_job(job: dict) -> None:
     # Reusable profile samples live under profiles/ and are intentionally kept.
     # Legacy per-job samples live under samples/ and expire with their job.
     sample = str(job.get("sample_path") or "")
+    voice_samples = job.get("voice_samples") or []
+    profile_samples = [str(item.get("sample_path") or "") for item in voice_samples if isinstance(item, dict)] if isinstance(voice_samples, list) else []
     paths = ([sample] if sample.startswith("samples/") else []) + [job.get("result_path")]
     storage_delete([path for path in paths if path])
     supabase_request("DELETE", f"/rest/v1/voice_note_jobs?id=eq.{job['id']}")
-    if sample.startswith("profiles/"):
-        encoded = quote(sample, safe="")
-        current = supabase_request("GET", f"/rest/v1/voice_note_profiles?sample_path=eq.{encoded}&select=profile_id&limit=1").json()
-        active = table(f"sample_path=eq.{encoded}&select=id&limit=1").json()
+    for path in set(profile_samples + ([sample] if sample.startswith("profiles/") else [])):
+        if not path.startswith("profiles/"):
+            continue
+        encoded = quote(path, safe="")
+        current = supabase_request("GET", f"/rest/v1/voice_note_profile_samples?sample_path=eq.{encoded}&select=sample_id&limit=1").json()
+        contains = quote('[{"sample_path":"' + path + '"}]', safe="")
+        active = table(f"or=(sample_path.eq.{encoded},voice_samples.cs.{contains})&select=id&limit=1").json()
         if not current and not active:
-            storage_delete([sample])
+            storage_delete([path])
 
 
 def purge_expired() -> None:
     now = datetime.now(timezone.utc).isoformat()
-    rows = table(f"expires_at=lt.{quote(now, safe=':.-')}&select=id,sample_path,result_path")
+    rows = table(f"expires_at=lt.{quote(now, safe=':.-')}&select=id,sample_path,result_path,voice_samples")
     for row in rows.json():
         try:
             delete_job(row)
@@ -114,7 +120,7 @@ def purge_expired() -> None:
 def bot_job(job_id: str) -> dict:
     if not JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(status_code=404, detail="job_not_found")
-    rows = table(f"id=eq.{job_id}&select=id,status,expires_at,duration_seconds,result_path")
+    rows = table(f"id=eq.{job_id}&select=id,status,expires_at,duration_seconds,result_path,sample_path,reference_text,voice_samples")
     found = rows.json()
     if not found:
         raise HTTPException(status_code=404, detail="job_not_found")
@@ -129,7 +135,14 @@ def current_voice_profile() -> dict | None:
     return rows[0] if rows else None
 
 
-def upsert_voice_profile(sample: bytes, filename: str, content_type: str, language: str, reference_text: str) -> None:
+def voice_profile_samples() -> list[dict]:
+    response = supabase_request(
+        "GET", "/rest/v1/voice_note_profile_samples?profile_id=eq.default&select=sample_id,sample_number,sample_path,reference_text&order=sample_number.asc"
+    )
+    return response.json()
+
+
+def validate_profile_sample(sample: bytes, filename: str, language: str, reference_text: str) -> str:
     extension = filename.rsplit(".", 1)[-1].lower()
     if extension not in {"wav", "mp3", "m4a", "ogg", "opus", "webm", "flac", "aac"}:
         raise HTTPException(status_code=400, detail="unsupported_audio")
@@ -140,30 +153,36 @@ def upsert_voice_profile(sample: bytes, filename: str, content_type: str, langua
     if not reference_text.strip() or len(reference_text) > MAX_REFERENCE_CHARS:
         raise HTTPException(status_code=400, detail="invalid_reference_text")
 
-    previous = current_voice_profile()
+    return extension
+
+
+def store_profile_sample(sample: bytes, filename: str, content_type: str, language: str, reference_text: str, *, first: bool) -> int:
+    extension = validate_profile_sample(sample, filename, language, reference_text)
+    profile = current_voice_profile()
+    if first and profile:
+        raise HTTPException(status_code=409, detail="voice_profile_already_exists_use_add_sample")
+    if not first and not profile:
+        raise HTTPException(status_code=409, detail="voice_profile_not_configured")
+    if not first and language != str(profile["language"]):
+        raise HTTPException(status_code=400, detail="sample_language_mismatch")
+    if not first and len(voice_profile_samples()) >= MAX_PROFILE_SAMPLES:
+        raise HTTPException(status_code=409, detail="voice_profile_sample_limit_reached")
     object_path = f"profiles/default-{uuid.uuid4()}.{extension}"
     storage_upload(object_path, sample, content_type or "application/octet-stream")
     try:
-        supabase_request(
-            "POST",
-            "/rest/v1/voice_note_profiles?on_conflict=profile_id",
-            json={
-                "profile_id": "default",
-                "sample_path": object_path,
-                "language": language,
-                "reference_text": reference_text.strip(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-        )
+        rpc = "create_voice_note_profile" if first else "append_voice_note_profile_sample"
+        arguments = {"p_sample_path": object_path, "p_reference_text": reference_text.strip()}
+        if first:
+            arguments["p_language"] = language
+        result = supabase_request("POST", f"/rest/v1/rpc/{rpc}", json=arguments).json()
     except Exception:
         storage_delete([object_path])
         raise
-    old_path = str((previous or {}).get("sample_path") or "")
-    if old_path and old_path != object_path:
-        active = table(f"sample_path=eq.{quote(old_path, safe='')}&select=id&limit=1").json()
-        if not active:
-            storage_delete([old_path])
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if isinstance(result, dict):
+        result = result.get("sample_number")
+    return int(result or (1 if first else len(voice_profile_samples())))
 
 
 def worker_claims(authorization: Annotated[str | None, Header()] = None) -> dict:
@@ -210,7 +229,9 @@ def signed_sample_url(object_path: str) -> str:
     response = supabase_request(
         "POST",
         f"/storage/v1/object/sign/{BUCKET}/{quote(object_path, safe='/')}",
-        json={"expiresIn": 180},
+        # All five samples are signed together. Give the runner enough time to
+        # download and upload the complete set while keeping URLs short-lived.
+        json={"expiresIn": 900},
     )
     signed = response.json().get("signedURL")
     if not isinstance(signed, str):
@@ -255,11 +276,14 @@ def healthz():
 def get_profile_status():
     profile = current_voice_profile()
     if not profile:
-        return {"configured": False}
+        return {"configured": False, "sample_count": 0, "max_samples": MAX_PROFILE_SAMPLES}
+    count = len(voice_profile_samples())
     return {
         "configured": True,
         "language": profile["language"],
         "updated_at": profile["updated_at"],
+        "sample_count": count,
+        "max_samples": MAX_PROFILE_SAMPLES,
     }
 
 
@@ -270,14 +294,35 @@ async def save_profile(
     language: Annotated[str, Form()] = "en",
 ):
     sample = await voice_sample.read(MAX_SAMPLE_BYTES + 1)
-    upsert_voice_profile(
+    sample_number = store_profile_sample(
         sample,
         voice_sample.filename or "voice-sample.ogg",
         voice_sample.content_type or "application/octet-stream",
         language,
         reference_text,
+        first=True,
     )
-    return {"configured": True, "language": language}
+    return {"configured": True, "language": language, "sample_number": sample_number, "sample_count": sample_number}
+
+
+@app.post("/v1/profile/samples", dependencies=[Depends(bot_auth)])
+async def add_profile_sample(
+    voice_sample: Annotated[UploadFile, File()],
+    reference_text: Annotated[str, Form()],
+    language: Annotated[str, Form()] = "en",
+):
+    sample = await voice_sample.read(MAX_SAMPLE_BYTES + 1)
+    profile = current_voice_profile()
+    selected_language = str(profile["language"]) if profile else language
+    sample_number = store_profile_sample(
+        sample,
+        voice_sample.filename or "voice-sample.ogg",
+        voice_sample.content_type or "application/octet-stream",
+        selected_language,
+        reference_text,
+        first=False,
+    )
+    return {"configured": True, "language": selected_language, "sample_number": sample_number, "sample_count": sample_number}
 
 
 @app.delete("/v1/profile", dependencies=[Depends(bot_auth)])
@@ -285,11 +330,15 @@ def delete_profile():
     profile = current_voice_profile()
     if not profile:
         return {"configured": False}
+    samples = voice_profile_samples()
     supabase_request("DELETE", "/rest/v1/voice_note_profiles?profile_id=eq.default")
-    old_path = str(profile.get("sample_path") or "")
-    active = table(f"sample_path=eq.{quote(old_path, safe='')}&select=id&limit=1").json()
-    if old_path and not active:
-        storage_delete([old_path])
+    for item in samples:
+        path = str(item.get("sample_path") or "")
+        encoded = quote(path, safe="")
+        contains = quote('[{"sample_path":"' + path + '"}]', safe="")
+        active = table(f"or=(sample_path.eq.{encoded},voice_samples.cs.{contains})&select=id&limit=1").json()
+        if path and not active:
+            storage_delete([path])
     return {"configured": False}
 
 
@@ -309,7 +358,11 @@ async def create_job(
 
     purge_expired()
     job_id = str(uuid.uuid4())
-    sample_path = str(profile["sample_path"])
+    profile_samples = voice_profile_samples()
+    if not 1 <= len(profile_samples) <= MAX_PROFILE_SAMPLES:
+        raise HTTPException(status_code=409, detail="voice_profile_samples_invalid")
+    sample_path = str(profile_samples[0]["sample_path"])
+    voice_samples = [{"sample_path": str(item["sample_path"]), "reference_text": str(item["reference_text"])} for item in profile_samples]
     now = datetime.now(timezone.utc)
     record = {
         "id": job_id,
@@ -318,6 +371,7 @@ async def create_job(
         "language": selected_language,
         "reference_text": profile["reference_text"],
         "sample_path": sample_path,
+        "voice_samples": voice_samples,
         "result_path": None,
         "run_id": None,
         "duration_seconds": None,
@@ -385,16 +439,29 @@ def claim_job(job_id: str, claims: dict = Depends(worker_claims)):
         raise HTTPException(status_code=409, detail="job_not_claimable")
     job = rows[0] if isinstance(rows, list) else rows
     try:
-        sample_url = signed_sample_url(job["sample_path"])
+        voice_samples = job.get("voice_samples")
+        if not isinstance(voice_samples, list) or not voice_samples:
+            voice_samples = [{"sample_path": job["sample_path"], "reference_text": job["reference_text"]}]
+        signed_samples = []
+        for item in voice_samples:
+            sample_url = signed_sample_url(str(item["sample_path"]))
+            signed_samples.append({
+                "reference_text": str(item["reference_text"]),
+                "voice_sample_url": sample_url,
+                "voice_sample_host": urlparse(sample_url).hostname,
+                "voice_sample_filename": str(item["sample_path"]).rsplit("/", 1)[-1],
+            })
     except Exception:
         raise HTTPException(status_code=502, detail="sample_unavailable") from None
     return {
         "text": job["text"],
         "language": job["language"],
         "reference_text": job["reference_text"],
-        "voice_sample_url": sample_url,
-        "voice_sample_host": urlparse(sample_url).hostname,
-        "voice_sample_filename": job["sample_path"].rsplit("/", 1)[-1],
+        "voice_samples": signed_samples,
+        "reference_text": signed_samples[0]["reference_text"],
+        "voice_sample_url": signed_samples[0]["voice_sample_url"],
+        "voice_sample_host": signed_samples[0]["voice_sample_host"],
+        "voice_sample_filename": signed_samples[0]["voice_sample_filename"],
     }
 
 

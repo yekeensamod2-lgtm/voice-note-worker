@@ -28,7 +28,8 @@ The SQL migration creates a private storage bucket and a table with RLS denying 
 
 Bot-side endpoints (Bearer `BOT_BRIDGE_TOKEN`):
 
-- `POST /v1/jobs` multipart fields `text`, `language`, `reference_text`, `voice_sample` (audio). Stores a private job/sample, dispatches the workflow with only the new UUID, returns `{job_id}`.
+- `PUT /v1/profile` stores the first private reference recording and its exact transcript. `POST /v1/profile/samples` appends another recording without replacing existing samples; profiles support up to five samples. `GET /v1/profile` reports the count, and `DELETE /v1/profile` removes the profile.
+- `POST /v1/jobs` stores the message and a private snapshot of every current profile sample and its transcript, dispatching the workflow with only the new UUID. The GitHub runner adds all saved samples to one temporary Voicebox profile for generation.
 - `GET /v1/jobs/{job_id}` returns status only.
 - `GET /v1/jobs/{job_id}/result` streams Ogg/Opus or a clip ZIP to the bot once, then deletes job and private sample/result objects.
 
